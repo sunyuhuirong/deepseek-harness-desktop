@@ -22,6 +22,15 @@ function tokenValue(cfg, name, mode) {
   return custom?.[mode] ?? preset.light?.[name] ?? preset.dark?.[name] ?? '';
 }
 
+function tokenAlpha(cfg, name, mode) {
+  const custom = cfg.customTokens?.[name];
+  return typeof custom?.[`${mode}Alpha`] === 'number' ? custom[`${mode}Alpha`] : 100;
+}
+
+function clampAlpha(value) {
+  return Math.min(100, Math.max(0, Math.round(value)));
+}
+
 export function AppearanceSection({ t, scope }) {
   const cfg = useSnapshot(scope);
   const set = useScopeSet(scope, cfg);
@@ -32,11 +41,48 @@ export function AppearanceSection({ t, scope }) {
       [name]: {
         light: tokenValue(cfg, name, 'light'),
         dark: tokenValue(cfg, name, 'dark'),
+        lightAlpha: tokenAlpha(cfg, name, 'light'),
+        darkAlpha: tokenAlpha(cfg, name, 'dark'),
         [mode]: value
       }
     };
     set('customTokens', next);
   };
+
+  const updateAlpha = (name, mode, value) => {
+    const next = {
+      ...(cfg.customTokens ?? {}),
+      [name]: {
+        light: tokenValue(cfg, name, 'light'),
+        dark: tokenValue(cfg, name, 'dark'),
+        lightAlpha: tokenAlpha(cfg, name, 'light'),
+        darkAlpha: tokenAlpha(cfg, name, 'dark'),
+        [`${mode}Alpha`]: clampAlpha(value)
+      }
+    };
+    set('customTokens', next);
+  };
+
+  const renderMode = (name, mode) => (
+    <label className="dsh-appearance-mode">
+      <span className="dsh-appearance-mode-label">{t(mode === 'light' ? 'token.light' : 'token.dark')}</span>
+      <input
+        type="color"
+        value={tokenValue(cfg, name, mode)}
+        onChange={(event) => updateToken(name, mode, event.target.value)}
+      />
+      <input
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={tokenAlpha(cfg, name, mode)}
+        title={t('token.alpha')}
+        onChange={(event) => updateAlpha(name, mode, Number(event.target.value))}
+      />
+      <span className="dsh-appearance-alpha-value">{tokenAlpha(cfg, name, mode)}%</span>
+    </label>
+  );
 
   return (
     <div className="dsh-appearance-section">
@@ -66,22 +112,8 @@ export function AppearanceSection({ t, scope }) {
           {group.tokens.map(([name, labelKey]) => (
             <div key={name} className="dsh-appearance-token-row">
               <span className="dsh-appearance-token-label">{t(labelKey)}</span>
-              <label>
-                {t('token.light')}
-                <input
-                  type="color"
-                  value={tokenValue(cfg, name, 'light')}
-                  onChange={(event) => updateToken(name, 'light', event.target.value)}
-                />
-              </label>
-              <label>
-                {t('token.dark')}
-                <input
-                  type="color"
-                  value={tokenValue(cfg, name, 'dark')}
-                  onChange={(event) => updateToken(name, 'dark', event.target.value)}
-                />
-              </label>
+              {renderMode(name, 'light')}
+              {renderMode(name, 'dark')}
             </div>
           ))}
         </fieldset>

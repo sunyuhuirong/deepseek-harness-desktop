@@ -16,7 +16,9 @@ const AppearanceSettingsSchema = z.object({
   themePreset: z.string().default('default'),
   customTokens: z.dict(z.object({
     light: z.string(),
-    dark: z.string()
+    dark: z.string(),
+    lightAlpha: z.number().default(100),
+    darkAlpha: z.number().default(100)
   })).default({})
 });
 

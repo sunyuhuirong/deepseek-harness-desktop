@@ -33,6 +33,7 @@ export const zh = {
   'token.stateBusiness': '业务色',
   'token.light': '浅色',
   'token.dark': '深色',
+  'token.alpha': '透明度',
   'token.clear': '清除全部自定义颜色'
 };
 
@@ -71,5 +72,6 @@ export const en = {
   'token.stateBusiness': 'Accent',
   'token.light': 'Light',
   'token.dark': 'Dark',
+  'token.alpha': 'Opacity',
   'token.clear': 'Clear all custom colors'
 };
