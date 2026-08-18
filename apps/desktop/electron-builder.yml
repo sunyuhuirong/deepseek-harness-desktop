@@ -1,0 +1,93 @@
+# Electron Builder Configuration for DeepSeek Harness Desktop
+appId: ai.deepseek.harness
+productName: DeepSeek Harness
+copyright: Copyright © 2025 DeepSeek
+directories:
+  buildResources: assets
+  output: dist
+electronDist: electron-dist
+files:
+  # Whitelist the app code; the dsh runtime (production node_modules) is pulled
+  # in automatically by electron-builder and unpacked to app.asar.unpacked.
+  - 'src/**/*'
+  - 'preload/**/*'
+  - 'profiles/**/*'
+  - 'package.json'
+  - '!**/*.test.*'
+asar: true
+# The dsh runtime stays in app.asar's index but is unpacked to
+# app.asar.unpacked/node_modules (production deps, flat). Keeps the asar file
+# small for fast cold start while letting the plain-Node child read the files
+# directly, without runtime extraction to the app data dir.
+asarUnpack:
+  - '**/node_modules/**'
+extraResources:
+  - from: assets/icon.png
+    to: icon.png
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: assets/icon.png
+  requestedExecutionLevel: asInvoker
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: DeepSeek Harness
+  installerIcon: assets/icon.png
+  uninstallerIcon: assets/icon.png
+  license: ../../LICENSE
+  menuCategory: DeepSeek
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    - target: zip
+      arch: [x64, arm64]
+  extraResources:
+    # Bundled Node for the dsh child process. GUI-launched apps get a minimal
+    # PATH and cannot rely on a system `node`; dsh also needs Node >= 22.13,
+    # which Electron 33's bundled Node (20.18) does not provide.
+    - from: resources/bin/darwin-${arch}
+      to: bin
+  category: public.app-category.productivity
+  icon: assets/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSCameraUsageDescription: "DeepSeek Harness需要访问摄像头以支持视频通话功能"
+    NSMicrophoneUsageDescription: "DeepSeek Harness需要访问麦克风以支持语音输入功能"
+  darkModeSupport: true
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  icon: assets/icon.png
+  category: Development
+  maintainer: DeepSeek AI
+  vendor: DeepSeek AI
+  synopsis: AI Coding Assistant
+  description: DeepSeek Harness Desktop - An AI-powered coding assistant with full extension support
+  desktop:
+    Name: DeepSeek Harness
+    Comment: AI Coding Assistant
+    Type: Application
+    Icon: deepseek-harness
+    Categories: Development;IDE;
+    Terminal: false
+    StartupNotify: true
+publish:
+  provider: github
+  owner: deepseek-ai
+  repo: deepseek-harness-desktop
+releaseInfo:
+  releaseName: "v${version}"
+  releaseNotes: "See CHANGELOG.md for details."

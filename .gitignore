@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Build output
+dist/
+build/
+out/
+*.asar
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# DSH specific
+.dsh/
+~/.dsh/
+
+# Electron
+.electron-app/
+
+# pnpm store & tool state
+.pnpm-store/
+.workbuddy/
+
+# Downloaded Electron dist (large; fetched by electron-builder via electronDist)
+apps/desktop/electron-dist/
+
+# Bundled Node binaries (fetched by apps/desktop/scripts/fetch-node.sh)
+apps/desktop/resources/bin/

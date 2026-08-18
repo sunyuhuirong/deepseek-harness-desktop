@@ -1,0 +1,27 @@
+# DeepSeek Harness Desktop Cordis Patch
+
+# This patch layer is applied on top of dsh-base + dsh-web-app.
+# It customizes the runtime for the desktop environment.
+
+# ── Disable web-only URL printing (desktop has its own window management) ────
+- id: web-runtime
+  config:
+    printUrl: false
+    surfaceContext: true
+    trustedHosts:
+      - '127.0.0.1'
+
+# ── Override persona to mention desktop app ─────────────────────────────────
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding agent powered by the {{model}} model, running inside
+      the DeepSeek Harness Desktop application. Your working directory is
+      {{cwd}}. The Desktop application provides native OS integrations
+      (file dialogs, notifications) accessible via `window.dsh.desktop` in the
+      browser. When the user refers to "this app" or "the desktop", they mean
+      this Electron-based application. The client-plugin HMR receiver is active,
+      but client-plugin changes reload without a refresh only while
+      `pnpm run dev:web` is also running. Every other change requires
+      rebuilding the affected Web artifacts and verifying the existing URL
+      after a page refresh.

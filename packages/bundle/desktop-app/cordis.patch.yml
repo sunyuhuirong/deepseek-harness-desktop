@@ -1,0 +1,286 @@
+# The desktop bundle patch: customizes the web-app runtime for the Electron
+# desktop environment. Applied after dsh-web-app's insert; rows here override
+# web-app rows by id, with the profile's own cordis.patch.yml still to come.
+#
+# Key differences from web-app:
+# - printUrl: false — the desktop app manages its own window, no need to print URL
+# - surfaceContext: true — still inform the model it's in a desktop app
+# - trustedHosts: only 127.0.0.1 — desktop never exposes to LAN
+# - Persona is overridden to mention "desktop application" instead of "Web GUI"
+
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding agent powered by the {{model}} model, running inside
+      the DeepSeek Harness Desktop application. Your working directory is
+      {{cwd}}. The Desktop application provides native OS integrations
+      (file dialogs, notifications) accessible via `window.dsh.desktop` in the
+      browser. When the user refers to "this app" or "the desktop", they mean
+      this Electron-based application. The client-plugin HMR receiver is active,
+      but client-plugin changes reload without a refresh only while
+      `pnpm run dev:web` is also running from this same checkout to rebuild their
+      bundles; verify that watcher before promising automatic updates. Every
+      other change — the apps/web shell and plain packages — requires rebuilding
+      the affected Web artifacts and verifying the existing URL after a page
+      refresh.
+
+# TODO: Re-enable shared HMR for Desktop after its reload lifecycle is tested.
+- id: hmr
+  disabled: true
+
+# Full-text session search is opt-in (the base row's `openAt: never`).
+- id: session-query-sqlite
+  config:
+    path: ':memory:'
+    openAt: never
+
+- id: tools
+  config:
+    mode: !!js process.env.DSH_TOOLS_MODE
+
+# ── desktop-specific host rows ────────────────────────────────────────────────
+# These are identical to web-app; we restate the key rows so they override cleanly.
+
+- id: storage
+  name: '@deepseek-ai/dsh-storage'
+
+- id: storage-json
+  name: '@deepseek-ai/dsh-storage-json'
+  config:
+    root: !!js dshHomePath('storages')
+
+- id: storage-domain
+  name: '@deepseek-ai/dsh-storage-domain'
+  config:
+    backend: json
+
+- id: message-feedback
+  name: '@deepseek-ai/dsh-message-feedback'
+  config:
+    maxNoteBytes: 8192
+
+- id: session-log-download
+  name: '@deepseek-ai/dsh-session-log-export'
+
+- id: workspace
+  name: '@deepseek-ai/dsh-workspace'
+
+- id: session-projection-cache
+  name: '@deepseek-ai/dsh-session-projection-cache'
+  config:
+    writeEveryEvents: 200
+    writeIntervalMs: 5000
+
+- id: session-stats
+  name: '@deepseek-ai/dsh-session-stats'
+
+- id: directory-picker
+  name: '@deepseek-ai/dsh-host-directory-picker-auto'
+
+- id: plugin-inventory
+  name: '@deepseek-ai/dsh-host-plugin-inventory'
+
+- id: api-gateway
+  name: '@deepseek-ai/dsh-host-apiproxy'
+
+- id: cordis-host-runner
+  name: '@deepseek-ai/dsh-cordis-host-runner'
+
+- id: web-startup
+  name: '@deepseek-ai/dsh-web-app/startup'
+
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  inject: [webStartup]
+  config:
+    host: !!js ctx.webStartup.host ?? '127.0.0.1'
+    port: !!js ctx.webStartup.port ?? 3080
+
+# Desktop runtime: resolved from the web-app glue but with printUrl=false.
+- id: web-runtime
+  name: '@deepseek-ai/dsh-web-app'
+  inject: [webStartup]
+  config:
+    printUrl: false
+    surfaceContext: true
+    trustedHosts:
+      - '127.0.0.1'
+
+- id: client-hmr
+  name: '@deepseek-ai/dsh-client-hmr'
+
+# ── browser plugin roster ─────────────────────────────────────────────────────
+- id: modules
+  name: '@deepseek-ai/dsh-client-modules'
+
+- id: connection
+  name: '@deepseek-ai/dsh-client-connection'
+  inject: [webRuntime]
+  config:
+    trustedHosts: !!js ctx.webRuntime.trustedHosts
+
+- id: api-remotes
+  name: '@deepseek-ai/dsh-api-remotes'
+
+- id: client-runtime
+  name: '@deepseek-ai/dsh-client-runtime'
+
+- id: cordis-client-runner
+  name: '@deepseek-ai/dsh-cordis-client-runner'
+
+- id: ui-theme
+  name: '@deepseek-ai/dsh-client-ui-theme'
+
+- id: locale
+  name: '@deepseek-ai/dsh-client-locale'
+
+- id: ui-layout
+  name: '@deepseek-ai/dsh-client-ui-layout'
+
+- id: ui-sidebar
+  name: '@deepseek-ai/dsh-client-ui-sidebar'
+
+- id: ui-settings
+  name: '@deepseek-ai/dsh-client-ui-settings'
+
+- id: ui-settings-general
+  name: '@deepseek-ai/dsh-client-ui-settings-general'
+
+- id: ui-settings-models
+  name: '@deepseek-ai/dsh-client-ui-settings-models'
+
+- id: ui-settings-plugin-inventory
+  name: '@deepseek-ai/dsh-client-ui-settings-plugin-inventory'
+
+- id: ui-conversation
+  name: '@deepseek-ai/dsh-client-ui-conversation'
+
+- id: ui-tool
+  name: '@deepseek-ai/dsh-client-ui-tool'
+
+- id: ui-cordis
+  name: '@deepseek-ai/dsh-client-ui-cordis'
+
+- id: ui-workflow-run
+  name: '@deepseek-ai/dsh-client-ui-workflow-run'
+
+- id: ui-deliverables
+  name: '@deepseek-ai/dsh-client-ui-deliverables'
+
+- id: ui-workspace
+  name: '@deepseek-ai/dsh-client-ui-workspace'
+
+- id: ui-input-trigger
+  name: '@deepseek-ai/dsh-client-ui-input-trigger'
+
+- id: ui-commands
+  name: '@deepseek-ai/dsh-client-ui-commands'
+
+- id: ui-skill
+  name: '@deepseek-ai/dsh-client-ui-skill'
+
+- id: ui-subagent
+  name: '@deepseek-ai/dsh-client-ui-subagent'
+
+- id: ui-jobs
+  name: '@deepseek-ai/dsh-client-ui-jobs'
+
+- id: ui-goal
+  name: '@deepseek-ai/dsh-client-ui-goal'
+
+- id: ui-message-feedback
+  name: '@deepseek-ai/dsh-client-ui-message-feedback'
+
+- id: ui-model-selection
+  name: '@deepseek-ai/dsh-client-ui-model-selection'
+
+- id: ui-permission
+  name: '@deepseek-ai/dsh-client-ui-permission-presets'
+
+- id: ui-agent-preset
+  name: '@deepseek-ai/dsh-client-ui-agent-preset'
+
+- id: ui-settings-plugins
+  name: '@deepseek-ai/dsh-client-ui-settings-plugins'
+
+- id: ui-plan
+  name: '@deepseek-ai/dsh-client-ui-plan'
+
+- id: ui-user-questions
+  name: '@deepseek-ai/dsh-client-ui-user-questions'
+
+- id: ui-trajectory
+  name: '@deepseek-ai/dsh-client-ui-trajectory'
+
+# ── Disable agent-plane rows (handled by presets) ────────────────────────────
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: tool-str-replace-editor
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- id: tool-subagent-report
+  disabled: true
+
+- id: workflow-worker-thread
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true
