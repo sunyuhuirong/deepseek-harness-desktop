@@ -18,6 +18,13 @@ contextBridge.exposeInMainWorld('dsh', {
     saveFilePicker: (defaultPath, filters) =>
       ipcRenderer.invoke('desktop:save-file-picker', defaultPath, filters),
 
+    // ── Plugin Manager ────────────────────────────────────────────────────────
+    pluginManager: {
+      list: () => ipcRenderer.invoke('desktop:plugin-manager-list'),
+      install: (spec) => ipcRenderer.invoke('desktop:plugin-manager-install', spec),
+      remove: (name) => ipcRenderer.invoke('desktop:plugin-manager-remove', name),
+    },
+
     // ── Notifications ───────────────────────────────────────────────────────
     showNotification: (options) =>
       ipcRenderer.invoke('desktop:show-notification', options),

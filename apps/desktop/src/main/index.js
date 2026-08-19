@@ -11,7 +11,7 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, shell, dialog, Notification } 
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const isDev = process.env.NODE_ENV === 'development';
@@ -46,6 +46,9 @@ const runsAsBundledNode = NODE_BIN === process.execPath;
 let mainWindow = null;
 let dshProcess = null;
 let tray = null;
+let dshHome = null;
+let dshCwd = null;
+let dshReady = false;
 app.isQuitting = false;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -351,6 +354,181 @@ function createTray() {
   return tray;
 }
 
+// ── Plugin Management (via IPC) ──────────────────────────────────────────────
+
+/**
+ * Read the current desktop profile manifest and project its installed plugins.
+ * The profile's package.json lives at $DSH_HOME/profiles/desktop/package.json
+ * and carries both the layer stack (dsh.profile.bundles) and the pnpm-managed
+ * dependencies. `dsh plugin` reconciles the two, so the bundles list is the
+ * authoritative "installed and active" roster.
+ */
+function listProfilePlugins(home) {
+  const manifestPath = join(home, 'profiles', 'desktop', 'package.json');
+  try {
+    if (!existsSync(manifestPath)) return { bundles: [], dependencies: {} };
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    return {
+      bundles: Array.isArray(manifest.dsh?.profile?.bundles) ? manifest.dsh.profile.bundles : [],
+      dependencies: manifest.dependencies ?? {},
+    };
+  } catch {
+    return { bundles: [], dependencies: {} };
+  }
+}
+
+/**
+ * Return the environment the dsh plugin child should run with. In dev the
+ * launcher's PATH already has pnpm, so process.env is fine as-is. In a
+ * packaged build the app is launched by Finder/Dock with a minimal PATH that
+ * usually lacks pnpm; `dsh plugin` (a thin pnpm forwarder) then fails with
+ * "pnpm not found on PATH". Probe the well-known install locations and prepend
+ * any directory that actually contains a pnpm binary.
+ * @returns {Promise<{ env: NodeJS.ProcessEnv, found: boolean }>}
+ */
+async function resolvePnpmEnv() {
+  if (!app.isPackaged) return { env: process.env, found: true };
+
+  const home = app.getPath('home');
+  const binDirs = [];
+  const addDir = (p) => {
+    try {
+      if (p && existsSync(p) && existsSync(join(p, 'pnpm'))) binDirs.push(p);
+    } catch {
+      // ignore unreadable candidates
+    }
+  };
+  addDir(process.env.PNPM_HOME);
+  addDir(join(home, 'Library', 'pnpm'));
+  addDir(join(home, '.local', 'share', 'pnpm'));
+  addDir(join(home, '.npm-global', 'bin'));
+  addDir('/opt/homebrew/bin');
+  addDir('/usr/local/bin');
+  try {
+    const base = join(home, '.nvm', 'versions', 'node');
+    for (const version of readdirSync(base)) {
+      const bin = join(base, version, 'bin');
+      if (existsSync(join(bin, 'pnpm'))) binDirs.push(bin);
+    }
+  } catch {
+    // nvm absent — fine
+  }
+  if (binDirs.length === 0) return { env: process.env, found: false };
+  return {
+    env: { ...process.env, PATH: `${binDirs.join(':')}:${process.env.PATH ?? ''}` },
+    found: true,
+  };
+}
+
+/**
+ * Run one `dsh plugin --profile desktop <args>` invocation as a child process.
+ * Reuses the same NODE_BIN/DSH_BIN/DSH_HOME plumbing as bootstrapDsh so a
+ * packaged build works without pnpm on the launcher PATH beyond dsh's own
+ * requirement (pnpm must still be resolvable by the child).
+ * @param args - pnpm arguments forwarded verbatim (e.g. ['add', spec]).
+ * @returns resolved { ok, code, output } with stdout+stderr captured.
+ */
+async function runDshPlugin(args) {
+  const { env, found } = await resolvePnpmEnv();
+  if (!found) {
+    return {
+      ok: false,
+      code: 127,
+      output: 'dsh: pnpm not found — install pnpm or set $PNPM_HOME so the desktop app can manage profile plugins',
+    };
+  }
+  return new Promise((resolve) => {
+    const proc = spawn(NODE_BIN, [DSH_BIN, 'plugin', '--profile', 'desktop', ...args], {
+      cwd: dshCwd,
+      env: {
+        ...env,
+        ...(runsAsBundledNode ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
+        DSH_HOME: dshHome,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let output = '';
+    proc.stdout.on('data', (chunk) => { output += chunk.toString(); });
+    proc.stderr.on('data', (chunk) => { output += chunk.toString(); });
+    proc.on('error', (err) => resolve({ ok: false, code: -1, output: String(err) }));
+    proc.on('close', (code) => resolve({ ok: code === 0, code, output }));
+  });
+}
+
+/**
+ * Parse the package names pnpm refused to build out of an install's stderr
+ * ("[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: node-pty@1.1.0, ...").
+ * The trailing "@version" is stripped so scoped names survive untouched.
+ * @param output - captured stdout+stderr of a failed dsh plugin add.
+ * @returns the plain package names whose build scripts were ignored.
+ */
+function parseIgnoredBuilds(output) {
+  const match = /Ignored build scripts:\s*([^\n]+)/.exec(output);
+  if (!match) return [];
+  return match[1]
+    .split(',')
+    .map((s) => s.trim().replace(/@[^@\s]+$/, ''))
+    .filter(Boolean);
+}
+
+/**
+ * Append items to a `key` list inside a small YAML file (pnpm-workspace.yaml),
+ * creating the file / key when missing. Only handles the flat `key:\n  - x`
+ * shape pnpm uses; other content is preserved.
+ * @param file - absolute path of the YAML file.
+ * @param key - the list key, e.g. "onlyBuiltDependencies".
+ * @param additions - item strings to ensure are present.
+ * @returns true when the file changed.
+ */
+function appendYamlListItems(file, key, additions) {
+  if (additions.length === 0) return false;
+  const content = existsSync(file) ? readFileSync(file, 'utf8') : '';
+  const lines = content.split('\n');
+  const keyLine = lines.findIndex((line) => new RegExp(`^${key}:\\s*$`).test(line));
+
+  if (keyLine === -1) {
+    const suffix = content && !content.endsWith('\n') ? '\n' : '';
+    writeFileSync(file, `${content}${suffix}${key}:\n${additions.map((a) => `  - ${a}\n`).join('')}`);
+    return true;
+  }
+
+  let end = keyLine + 1;
+  while (end < lines.length && /^\s+-\s+\S/.test(lines[end])) end += 1;
+  const present = new Set(lines.slice(keyLine + 1, end).map((l) => l.trim().replace(/^-\s*/, '')));
+  const fresh = additions.filter((a) => !present.has(a));
+  if (fresh.length === 0) return false;
+  lines.splice(end, 0, ...fresh.map((a) => `  - ${a}`));
+  writeFileSync(file, `${lines.join('\n')}\n`);
+  return true;
+}
+
+/**
+ * Restart the dsh child process so profile changes (new/removed bundles) take
+ * effect, then point the window at the fresh URL. Called after a successful
+ * plugin install/remove; the renderer reloads as part of loadURL.
+ */
+function restartDsh() {
+  return new Promise((resolve, reject) => {
+    const boot = () => bootstrapDsh(dshCwd).then(({ url, process: proc }) => {
+      dshProcess = proc;
+      dshReady = true;
+      if (mainWindow) {
+        mainWindow.loadURL(url).catch(() => {});
+      }
+      resolve();
+    }, reject);
+
+    if (dshProcess) {
+      const old = dshProcess;
+      old.once('exit', boot);
+      old.kill('SIGTERM');
+    } else {
+      boot();
+    }
+  });
+}
+
 // ── Native Dialogs (via IPC) ─────────────────────────────────────────────────
 
 function setupIpcHandlers() {
@@ -427,6 +605,65 @@ function setupIpcHandlers() {
   ipcMain.on('desktop:window-close', () => {
     mainWindow?.close();
   });
+
+  // ── Plugin Manager ──────────────────────────────────────────────────────────
+
+  // Read the installed plugin roster from the desktop profile manifest.
+  ipcMain.handle('desktop:plugin-manager-list', () => listProfilePlugins(dshHome));
+
+  // Install a plugin from an npm spec (package name, path, or tarball). On
+  // success the dsh process restarts automatically to activate the new bundle.
+  ipcMain.handle('desktop:plugin-manager-install', async (_event, spec) => {
+    const value = typeof spec === 'string' ? spec.trim() : '';
+    if (!value) return { ok: false, code: -1, output: 'empty install spec' };
+    // Arguments reach the child as an argv array (no shell on non-Windows), so
+    // a leading dash cannot become a flag; reject it defensively anyway.
+    if (value.startsWith('-')) return { ok: false, code: -1, output: 'invalid spec (leading dash)' };
+
+    // pnpm >= 10 refuses to run dependency build scripts by default and, when
+    // it had to ignore some, fails the install with ERR_PNPM_IGNORED_BUILDS.
+    // That is "pnpm approve-builds" in one step: parse the ignored names,
+    // allowlist them in the profile's pnpm-workspace.yaml, and retry until the
+    // install actually succeeds (the packages themselves are already fetched).
+    const profileDir = join(dshHome, 'profiles', 'desktop');
+    let result = await runDshPlugin(['add', value]);
+    let attempts = 0;
+    while (!result.ok && result.output.includes('ERR_PNPM_IGNORED_BUILDS') && attempts < 3) {
+      const approved = appendYamlListItems(
+        join(profileDir, 'pnpm-workspace.yaml'),
+        'onlyBuiltDependencies',
+        parseIgnoredBuilds(result.output),
+      );
+      if (!approved) break;
+      attempts += 1;
+      result = await runDshPlugin(['add', value]);
+    }
+
+    if (result.ok) {
+      try {
+        await restartDsh();
+      } catch (err) {
+        return { ...result, output: `${result.output}\n[restart failed] ${String(err)}` };
+      }
+    }
+    return result;
+  });
+
+  // Remove a plugin by package name, then restart dsh to deactivate it.
+  ipcMain.handle('desktop:plugin-manager-remove', async (_event, name) => {
+    const value = typeof name === 'string' ? name.trim() : '';
+    if (!value) return { ok: false, code: -1, output: 'empty plugin name' };
+    if (value.startsWith('-')) return { ok: false, code: -1, output: 'invalid name (leading dash)' };
+    const result = await runDshPlugin(['remove', value]);
+    if (result.ok) {
+      try {
+        await restartDsh();
+      } catch (err) {
+        return { ...result, output: `${result.output}\n[restart failed] ${String(err)}` };
+      }
+    }
+    return result;
+  });
 }
 
 // ── App Lifecycle ────────────────────────────────────────────────────────────
@@ -457,11 +694,10 @@ app.whenReady().then(async () => {
   // In a packaged build the profile tree (profiles/, storages/, settings.yaml)
   // lives under the app data dir, so dsh must run with that as its working
   // directory to locate the `desktop` profile. In dev, run from the app dir.
-  const dshHome = process.env.DSH_HOME || join(app.getPath('appData'), 'deepseek-harness');
-  const dshCwd = isDev ? (process.cwd() || app.getPath('home')) : dshHome;
+  dshHome = process.env.DSH_HOME || join(app.getPath('appData'), 'deepseek-harness');
+  dshCwd = isDev ? (process.cwd() || app.getPath('home')) : dshHome;
 
   // Retry the initial navigation while dsh is still booting (port 3080 not up).
-  let dshReady = false;
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, _desc, _url, isMainFrame) => {
     if (!isMainFrame || dshReady || errorCode !== -102) return;
     setTimeout(() => {

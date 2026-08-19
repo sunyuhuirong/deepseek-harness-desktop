@@ -3,7 +3,8 @@
   "bundles": [
     "@deepseek-ai/dsh-base",
     "@deepseek-ai/dsh-web-app",
-    "@deepseek-ai/dsh-bundle-desktop"
+    "@deepseek-ai/dsh-bundle-desktop",
+    "dsh-plugin-manager"
   ],
   "agentPreset": "standard"
 }
