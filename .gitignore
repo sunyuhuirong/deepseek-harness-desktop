@@ -54,3 +54,6 @@ apps/desktop/electron-dist/
 
 # Bundled Node binaries (fetched by apps/desktop/scripts/fetch-node.sh)
 apps/desktop/resources/bin/
+
+# Plugins live in separate git projects
+packages/extension/

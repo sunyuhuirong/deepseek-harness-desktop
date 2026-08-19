@@ -1,5 +1,0 @@
-# dsh-appearance 插件注册：挂载到 desktop profile
-
-- insert:
-    - id: dsh-appearance
-      name: 'dsh-appearance'
