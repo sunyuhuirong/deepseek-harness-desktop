@@ -11,7 +11,19 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, shell, dialog, Notification } 
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, cpSync, rmSync } from 'fs';
+// electron-updater is CommonJS; under ESM its named export is not statically
+// analyzable, so import the default and destructure.
+import electronUpdater from 'electron-updater';
+const { autoUpdater } = electronUpdater;
+
+// Capture otherwise-silent startup failures in packaged builds.
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED_REJECTION:', reason);
+});
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const isDev = process.env.NODE_ENV === 'development';
@@ -19,13 +31,25 @@ const isDev = process.env.NODE_ENV === 'development';
 // ── DSH Path Configuration ───────────────────────────────────────────────────
 // In dev, the dsh packages live in this app's own node_modules. In a packaged
 // build the runtime is unpacked to app.asar.unpacked/node_modules (see
-// asarUnpack in electron-builder.yml) so the plain-Node child can read it
-// directly, with no runtime extraction to the app data dir.
+// asarUnpack in electron-builder.yml) as the seed source; the actual dsh kernel
+// the app runs lives in an independent runtime dir under the Harness home so
+// the shell (this app) and the kernel (dsh) can be upgraded separately.
 const DSH_PACKAGE_PATH = isDev
   ? app.getAppPath()
   : join(process.resourcesPath, 'app.asar.unpacked');
 
-const DSH_BIN = join(DSH_PACKAGE_PATH, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+// The bundled kernel (seed) shipped inside the app.
+const DSH_SEED_BIN = join(DSH_PACKAGE_PATH, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+
+// Runtime kernel home (independent of the app bundle, so it survives shell
+// upgrades). Same layout as DSH_PACKAGE_PATH: node_modules at its root.
+const DSH_HOME = () => (process.env.DSH_HOME || join(app.getPath('appData'), 'deepseek-harness'));
+const DSH_RUNTIME_DIR = () => join(DSH_HOME(), 'runtime');
+const DSH_RUNTIME_BIN = () => join(DSH_RUNTIME_DIR(), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+
+// The dsh binary the app actually boots. In dev it is the local node_modules;
+// in a packaged build it is the (possibly upgraded) independent runtime dir.
+const DSH_BIN = () => (isDev ? DSH_SEED_BIN : DSH_RUNTIME_BIN());
 
 // dsh is a Node CLI — run it under a real Node, not the Electron GUI binary.
 // In a packaged build the app is launched by Finder/Dock with a minimal PATH
@@ -51,20 +75,172 @@ let dshCwd = null;
 let dshReady = false;
 app.isQuitting = false;
 
+// Auto-update state (shell = this app). Kernel version is tracked separately;
+// shell upgrades come from the GitHub release feed via electron-updater.
+let dshKernelVersion = null;
+let updateState = {
+  status: 'idle', // idle | checking | available | not-available | downloading | downloaded | error
+  version: null,
+  error: null,
+  progress: null,
+};
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * In a packaged build the dsh runtime ships unpacked under
- * Contents/Resources/app.asar.unpacked (see asarUnpack in electron-builder.yml),
- * so nothing needs to be extracted — just verify it is bundled before booting.
+ * In a packaged build the dsh kernel the app runs lives in an independent
+ * runtime dir under the Harness home (so the shell and kernel upgrade apart).
+ * The first launch seeds that dir from the bundled copy in
+ * app.asar.unpacked; later launches reuse it — a newer kernel published by the
+ * dsh project can be installed into the same dir independently of the shell.
+ *
+ * Returns the version of the dsh kernel that will be booted.
  */
 function ensureDshRuntime() {
-  if (isDev) return;
+  if (isDev) return null;
 
-  const binPath = join(DSH_PACKAGE_PATH, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  if (!existsSync(binPath)) {
-    throw new Error(`dsh runtime not bundled: ${binPath}`);
+  const seedBin = DSH_SEED_BIN;
+  if (!existsSync(seedBin)) {
+    throw new Error(`bundled dsh runtime not found: ${seedBin}`);
   }
+
+  const runtimeBin = DSH_RUNTIME_BIN();
+  if (!existsSync(runtimeBin)) {
+    console.log('[dsh] seeding runtime kernel …');
+    const seedModules = join(DSH_PACKAGE_PATH, 'node_modules');
+    const runtimeModules = join(DSH_RUNTIME_DIR(), 'node_modules');
+    mkdirSync(DSH_RUNTIME_DIR(), { recursive: true });
+    // Copy the full bundled node_modules into the runtime dir. cpSync cannot
+    // read from inside app.asar directly (opendir is not patched), but the
+    // seed lives in app.asar.unpacked (real files), so a plain copy works.
+    cpSync(seedModules, runtimeModules, { recursive: true });
+    console.log('[dsh] runtime kernel seeded');
+  }
+
+  return readDshKernelVersion(runtimeBin);
+}
+
+/** Read the `version` field from the dsh package next to a bin.js path. */
+function readDshKernelVersion(dshBinPath) {
+  try {
+    const pkgPath = join(dirname(dshBinPath), '..', 'package.json');
+    return JSON.parse(readFileSync(pkgPath, 'utf8')).version;
+  } catch {
+    return null;
+  }
+}
+
+// ── Shell Auto-Update ─────────────────────────────────────────────────────────
+
+/**
+ * The current update feed configuration, or null when the app is not packaged
+ * (development runs have no release feed). electron-updater reads the publish
+ * block from app-update.yml at runtime, so no explicit feed URL is needed.
+ */
+function updateFeedConfigured() {
+  return app.isPackaged && process.platform !== 'linux';
+}
+
+/**
+ * Push the current update state to the renderer (if a window is up) and to the
+ * tray tooltip label. Call this after every state transition.
+ */
+function broadcastUpdateState() {
+  const payload = { ...updateState };
+  mainWindow?.webContents.send('update:state', payload);
+}
+
+function setUpdateState(patch) {
+  updateState = { ...updateState, ...patch };
+  broadcastUpdateState();
+}
+
+/**
+ * Wire electron-updater for the shell (this app). autoDownload is off so the
+ * user confirms before a large binary download; the renderer calls
+ * update:download / update:install to drive the flow. Events are forwarded to
+ * the renderer via the update:state channel.
+ */
+function setupAutoUpdater() {
+  if (!updateFeedConfigured()) return;
+
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    setUpdateState({ status: 'checking', version: null, error: null, progress: null });
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    setUpdateState({ status: 'available', version: info.version, progress: null });
+  });
+
+  autoUpdater.on('update-not-available', (info) => {
+    setUpdateState({ status: 'not-available', version: info.version });
+  });
+
+  autoUpdater.on('download-progress', (progressObj) => {
+    setUpdateState({ status: 'downloading', progress: progressObj.percent });
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    setUpdateState({ status: 'downloaded', version: info.version });
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.error('[update]', err);
+    setUpdateState({ status: 'error', error: err.message || String(err) });
+  });
+
+  // Startup check (quiet): only log, the renderer learns via update:state.
+  const kernelVersion = dshKernelVersion;
+  console.log(`[update] shell=${app.getVersion()} kernel=${kernelVersion ?? 'n/a'} — checking for updates`);
+  autoUpdater.checkForUpdates().catch((err) => {
+    console.error('[update] initial check failed:', err);
+    setUpdateState({ status: 'error', error: err.message || String(err) });
+  });
+}
+
+/**
+ * Trigger a manual check for a shell update from the renderer or tray.
+ * @returns a snapshot of the new state.
+ */
+async function checkForShellUpdate() {
+  if (!updateFeedConfigured()) {
+    setUpdateState({ status: 'error', error: '更新仅在安装版应用中可用' });
+    return updateState;
+  }
+  setUpdateState({ status: 'checking', version: null, error: null, progress: null });
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (err) {
+    console.error('[update] check failed:', err);
+    setUpdateState({ status: 'error', error: err.message || String(err) });
+  }
+  return updateState;
+}
+
+/** Download a previously announced shell update (user confirmed). */
+async function downloadShellUpdate() {
+  if (!updateFeedConfigured()) {
+    setUpdateState({ status: 'error', error: '更新仅在安装版应用中可用' });
+    return updateState;
+  }
+  try {
+    await autoUpdater.downloadUpdate();
+  } catch (err) {
+    console.error('[update] download failed:', err);
+    setUpdateState({ status: 'error', error: err.message || String(err) });
+  }
+  return updateState;
+}
+
+/** Apply a downloaded shell update and restart the app. */
+function installShellUpdate() {
+  if (!updateFeedConfigured()) return;
+  if (updateState.status !== 'downloaded') return;
+  app.isQuitting = true;
+  autoUpdater.quitAndInstall();
 }
 
 /**
@@ -120,12 +296,12 @@ function bootstrapDsh(cwd) {
       args.push(...process.argv.slice(doubleDashIdx + 1));
     }
 
-    const proc = spawn(NODE_BIN, [DSH_BIN, ...args], {
+    const proc = spawn(NODE_BIN, [DSH_BIN(), ...args], {
       cwd,
       env: {
         ...process.env,
         ...(runsAsBundledNode ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
-        DSH_HOME: process.env.DSH_HOME || join(app.getPath('appData'), 'deepseek-harness'),
+        DSH_HOME: DSH_HOME(),
         NODE_ENV: isDev ? 'development' : 'production',
       },
       stdio: ['inherit', 'pipe', 'pipe'],
@@ -198,19 +374,11 @@ function createWindow(webUrl) {
   // background); navigation failures are handled by the did-fail-load retry.
   mainWindow.loadURL(webUrl).catch(() => {});
 
-  // Apply the rounded-corner shell styling (the transparent window is only
-  // rounded if the page itself clips its background to a radius).
-  mainWindow.webContents.on('did-finish-load', () => {
-    mainWindow.webContents.insertCSS(`
-      html, body { border-radius: 36px; }
-      html { overflow: hidden; }
-    `);
-    // Make the window draggable: a transparent drag strip across the top,
-    // while interactive elements inside that strip stay clickable. Only
-    // elements that overlap the strip are raised above it; everything else
-    // keeps its natural stacking so overlays like the settings panel are not
-    // covered.
-    mainWindow.webContents.executeJavaScript(`
+  // Strip + raise overlay injected into the renderer. Defined at module level
+  // so the periodic re-inject below can reference it; the SPA reloads during
+  // backend boot retries and drops the injected script, so we re-inject on a
+  // timer to keep the fix present at all times.
+  const STRIP_SCRIPT = `
       (() => {
         if (document.getElementById('dsh-drag-strip')) return;
         const strip = document.createElement('div');
@@ -218,27 +386,166 @@ function createWindow(webUrl) {
         strip.style.cssText = 'position:fixed;top:0;left:0;right:0;height:38px;z-index:100;-webkit-app-region:drag;';
         document.body.appendChild(strip);
 
+        // Raise style: any raised ancestor sits above the strip so click targets
+        // inside stacking-context containers stay reachable regardless of how the
+        // renderer structures them.
+        const STYLE_ID = 'dsh-drag-strip-raise-style';
+        if (!document.getElementById(STYLE_ID)) {
+          const s = document.createElement('style');
+          s.id = STYLE_ID;
+          s.textContent = '.dsh-drag-raised { z-index: 200 !important; }' +
+            // 面板 tab 栏：提到拖动条上层（右侧/底部面板折叠时 tab 栏在 strip
+            // 区；面板本体 z-auto 不创建 stacking context，tabBar 提 z 即可越过
+            // strip，无需抬整个面板）。
+            '[class*="tabBar"] { position: relative !important; z-index: 200 !important; }' +
+            // sessionLog/导出按钮：始终提到拖动条上层（视觉完整且可点）。
+            '[class*="sessionLogButton"] { position: relative !important; z-index: 200 !important; }' +
+            // 设置弹窗：始终在最顶层，避免被抬升容器（z:200）或其它浮层盖住。
+            '[class*="settings"]:not([class*="Button"]):not([class*="button"]):not([class*="icon"]):not([class*="Icon"]):not([class*="trigger"]):not([class*="Trigger"]):not([class*="tab"]):not([class*="Tab"]) { z-index: 9999 !important; }' +
+            // shl-session-history 滑轨：高于抬升容器（200）以保持可见，低于弹窗
+            // （tooltip 401、modal 1000）以免盖住弹窗。
+            '.shlrail_fixed { z-index: 201 !important; }' +
+            '.shlrail_tooltip { z-index: 202 !important; }';
+          document.head.appendChild(s);
+        }
+
+        // Broad interactive-element net: includes divs styled as tabs/buttons
+        // that the previous narrow list missed.
+        const INTERACTIVE = 'button, a, input, textarea, select, [role="button"], [tabindex], [contenteditable], [onclick], [onmousedown], [class*="tab"], [class*="btn"], [class*="Button"], [class*="icon"], [class*="crumb"], [class*="menu"], [class*="dropdown"], [class*="close"]';
+
         const update = () => {
           const sr = strip.getBoundingClientRect();
-          for (const el of document.querySelectorAll('button, a, input, textarea, select, [role="button"]')) {
-            const r = el.getBoundingClientRect();
-            const overlaps = r.top < sr.bottom && r.bottom > sr.top && r.left < sr.right && r.right > sr.left && r.width > 0;
-            if (overlaps) {
-              el.style.setProperty('-webkit-app-region', 'no-drag');
-              el.style.position = 'relative';
+          const active = new Set();
+          let nodes;
+          try { nodes = document.querySelectorAll(INTERACTIVE); } catch { nodes = []; }
+          for (const el of nodes) {
+            try {
+              const r = el.getBoundingClientRect();
+              const overlaps = r.width > 0 && r.height > 0 &&
+                r.top < sr.bottom && r.bottom > sr.top &&
+                r.left < sr.right && r.right > sr.left &&
+                r.top < innerHeight && r.bottom > 0;
+              if (!overlaps) {
+                if (el.dataset.dshRaised) {
+                  el.style.removeProperty('z-index');
+                  el.style.removeProperty('position');
+                  delete el.dataset.dshRaised;
+                }
+                continue;
+              }
+            el.style.setProperty('-webkit-app-region', 'no-drag');
+            // Raise the whole ancestor chain so the element escapes every
+            // stacking context that could otherwise trap it below the strip.
+            // Static ancestors are promoted to relative so z-index takes
+            // effect; the chain runs all the way up so fixed containers nested
+            // in an unpainted parent (e.g. a plugin sidebar panel) still clear
+            // the strip. Ancestors already above the strip level keep their
+            // natural stacking so overlays are not flattened.
+            let raised = false;
+            let target = null;
+            let anc = el.parentElement;
+            while (anc && anc !== document.body && anc !== document.documentElement) {
+              if (anc.classList.contains('dsh-drag-raised')) {
+                // An outer ancestor is already raised above the strip, so every
+                // element inside it is reachable — keep it and stop. Checking
+                // the computed z-index alone is not enough: the raise class
+                // bumps it to 200, which would read as "already above the
+                // strip" and get dropped on the next sweep.
+                active.add(anc);
+                raised = true;
+                target = null;
+                break;
+              }
+              const st = getComputedStyle(anc);
+              const z = parseInt(st.zIndex, 10);
+              if (st.position !== 'static' && !Number.isNaN(z) && z >= 100) {
+                // An ancestor already sits at/above the strip level, so
+                // everything inside it is above the strip. Raising further
+                // would only cover unrelated siblings (e.g. the sidebar tabs)
+                // for no benefit — stop here.
+                raised = true;
+                target = null;
+                break;
+              }
+              if (Number.isNaN(z) || z < 200) {
+                // Remember the outermost positioned ancestor still below the
+                // strip level. Hoisting that single outer container lifts the
+                // button out of every intermediate stacking context (fixed
+                // panels, transparent wrappers) without re-ordering siblings
+                // inside the panel.
+                target = { el: anc, st };
+              }
+              anc = anc.parentElement;
+            }
+            if (!raised && target) {
+              const t = target.el;
+              if (target.st.position === 'static') {
+                t.style.position = 'relative';
+                t.dataset.dshStaticRaised = '1';
+              }
+              t.classList.add('dsh-drag-raised');
+              active.add(t);
+              raised = true;
+            }
+            // No raised ancestor: lift the element itself, keeping its own
+            // position (fixed/absolute must not become relative or the layout
+            // breaks); static elements are promoted to relative so z-index
+            // takes effect.
+            if (!raised) {
+              const st = getComputedStyle(el);
+              if (st.position === 'static') el.style.position = 'relative';
               el.style.zIndex = '200';
-            } else if (el.style.zIndex === '200') {
-              el.style.removeProperty('-webkit-app-region');
-              el.style.position = '';
-              el.style.zIndex = '';
+              el.dataset.dshRaised = '1';
+            }
+            } catch (e) {}
+          }
+          // Drop the raise class from ancestors that no longer need it.
+          const raisedEls = document.querySelectorAll('.dsh-drag-raised');
+          for (const el of raisedEls) {
+            if (!active.has(el)) {
+              el.classList.remove('dsh-drag-raised');
+              if (el.dataset.dshStaticRaised) {
+                el.style.removeProperty('position');
+                delete el.dataset.dshStaticRaised;
+              }
             }
           }
         };
+
         update();
-        new MutationObserver(update).observe(document.body, { childList: true, subtree: true });
+        const schedule = () => {
+          clearTimeout(update._t);
+          update._t = setTimeout(update, 40);
+        };
+        new MutationObserver(schedule).observe(document.body, {
+          childList: true, subtree: true, attributes: true,
+          attributeFilter: ['class', 'style']
+        });
+        // Panel show/hide and window resizing are class/style changes (not node
+        // insertions); listen to both so the raise logic reacts immediately.
+        window.addEventListener('resize', schedule);
+        // Periodic sweep: guarantees convergence even if the observer misses a
+        // purely positional change.
+        setInterval(update, 1000);
       })();
-    `).catch(() => {});
+    `;
+
+  // Apply the rounded-corner shell styling (the transparent window is only
+  // rounded if the page itself clips its background to a radius).
+  mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow.webContents.insertCSS(`
+      html, body { border-radius: 36px; }
+      html { overflow: hidden; }
+    `);
+    mainWindow.webContents.executeJavaScript(STRIP_SCRIPT).catch(() => {});
   });
+
+  // Re-inject periodically: the SPA reloads during backend boot retries and
+  // drops the injected script; keep the strip + raise logic always present so
+  // the fix survives app restarts and renderer reloads.
+  setInterval(() => {
+    mainWindow.webContents.executeJavaScript(STRIP_SCRIPT).catch(() => {});
+  }, 3000);
 
   // DevTools in development
   if (isDev) {
@@ -325,6 +632,13 @@ function createTray() {
       label: '新建会话',
       click: () => {
         mainWindow?.focus();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '检查更新…',
+      click: () => {
+        checkForShellUpdate();
       },
     },
     { type: 'separator' },
@@ -438,7 +752,7 @@ async function runDshPlugin(args) {
     };
   }
   return new Promise((resolve) => {
-    const proc = spawn(NODE_BIN, [DSH_BIN, 'plugin', '--profile', 'desktop', ...args], {
+    const proc = spawn(NODE_BIN, [DSH_BIN(), 'plugin', '--profile', 'desktop', ...args], {
       cwd: dshCwd,
       env: {
         ...env,
@@ -578,6 +892,30 @@ function setupIpcHandlers() {
     return app.getVersion();
   });
 
+  // ── Auto-Update (shell) ────────────────────────────────────────────────────
+
+  // Current update state snapshot (rendered by the settings page).
+  ipcMain.handle('update:get-state', () => {
+    return {
+      ...updateState,
+      shellVersion: app.getVersion(),
+      kernelVersion: dshKernelVersion,
+      configured: updateFeedConfigured(),
+    };
+  });
+
+  // Manual "check for updates" from the renderer or tray.
+  ipcMain.handle('update:check', async () => checkForShellUpdate());
+
+  // User confirmed the announced update — start downloading it.
+  ipcMain.handle('update:download', async () => downloadShellUpdate());
+
+  // User confirmed the download — apply and restart.
+  ipcMain.handle('update:install', () => {
+    installShellUpdate();
+    return updateState;
+  });
+
   // Get platform info
   ipcMain.handle('desktop:get-platform-info', () => {
     return {
@@ -694,7 +1032,7 @@ app.whenReady().then(async () => {
   // In a packaged build the profile tree (profiles/, storages/, settings.yaml)
   // lives under the app data dir, so dsh must run with that as its working
   // directory to locate the `desktop` profile. In dev, run from the app dir.
-  dshHome = process.env.DSH_HOME || join(app.getPath('appData'), 'deepseek-harness');
+  dshHome = DSH_HOME();
   dshCwd = isDev ? (process.cwd() || app.getPath('home')) : dshHome;
 
   // Retry the initial navigation while dsh is still booting (port 3080 not up).
@@ -706,11 +1044,14 @@ app.whenReady().then(async () => {
   });
 
   try {
-    ensureDshRuntime();
+    dshKernelVersion = ensureDshRuntime();
     ensureProfileTree(dshHome);
     const { url, process: dshProc } = await bootstrapDsh(dshCwd);
     dshProcess = dshProc;
     dshReady = true;
+
+    // Startup update check (quiet; renderer learns via update:state).
+    setupAutoUpdater();
 
     // Point the window at the resolved URL unless it already loaded it.
     if (mainWindow) {

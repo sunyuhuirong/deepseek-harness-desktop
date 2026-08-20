@@ -33,6 +33,19 @@ contextBridge.exposeInMainWorld('dsh', {
     openExternal: (url) =>
       ipcRenderer.invoke('desktop:open-external', url),
 
+    // ── Auto-Update (shell) ─────────────────────────────────────────────────
+    update: {
+      getState: () => ipcRenderer.invoke('update:get-state'),
+      check: () => ipcRenderer.invoke('update:check'),
+      download: () => ipcRenderer.invoke('update:download'),
+      install: () => ipcRenderer.invoke('update:install'),
+      onState: (callback) => {
+        const subscription = (_event, state) => callback(state);
+        ipcRenderer.on('update:state', subscription);
+        return () => ipcRenderer.removeListener('update:state', subscription);
+      },
+    },
+
     // ── App Info ────────────────────────────────────────────────────────────
     getVersion: () =>
       ipcRenderer.invoke('desktop:get-version'),

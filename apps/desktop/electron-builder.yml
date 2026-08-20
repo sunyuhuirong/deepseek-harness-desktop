@@ -86,7 +86,7 @@ linux:
     StartupNotify: true
 publish:
   provider: github
-  owner: deepseek-ai
+  owner: sunyuhuirong
   repo: deepseek-harness-desktop
 releaseInfo:
   releaseName: "v${version}"

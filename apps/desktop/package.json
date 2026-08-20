@@ -38,7 +38,8 @@
     "@deepseek-ai/dsh-web-app": "^0.1.0-rc.7",
     "@deepseek-ai/dsh-workflow": "^0.1.0-rc.7",
     "dsh-appearance": "file:../../packages/extension/dsh-appearance",
-    "dsh-plugin-manager": "file:../../packages/extension/dsh-plugin-manager"
+    "dsh-plugin-manager": "file:../../packages/extension/dsh-plugin-manager",
+    "electron-updater": "^6.8.9"
   },
   "devDependencies": {
     "electron": "^33.0.0",

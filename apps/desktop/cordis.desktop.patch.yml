@@ -25,3 +25,7 @@
       `pnpm run dev:web` is also running. Every other change requires
       rebuilding the affected Web artifacts and verifying the existing URL
       after a page refresh.
+# ── Register deepseek-account plugin: wallet button + balance in sidebar ────
+- insert:
+    - id: deepseek-account
+      name: '@deepseek-ai/dsh-deepseek-account'
